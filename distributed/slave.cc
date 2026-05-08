@@ -6,7 +6,7 @@
 #include <iostream>        // std::cout, std::cerr
 #include <string>          // std::string
 #include <sstream>         // std::istringstream
-#include <cstring>         // memset() 用于清空内存
+#include <cstring>         // memset()
 #include <unistd.h>        // close(), read(), write()
 #include <sys/socket.h>    // socket(), bind(), listen(), accept()
 #include <netinet/in.h>    // sockaddr_in, htons(), htonl()
@@ -22,7 +22,9 @@
 #include "leveldb/slice.h"
 #include "leveldb/write_batch.h"
 
-int WORKER_PORT = 8889; // 如果不指明端口，则默认启用的端口号
+int worker_id = -1;                          // worker 索引，必须在启动时通过参数显式指定
+const std::string MASTER_HOST = "127.0.0.1"; // master 的监听地址
+const int MASTER_PORT = 8889;                // master 的连接从节点的端口
 
 // 全局数据库指针和运行标志，供信号处理器使用
 static leveldb::DB* g_db = nullptr;
@@ -43,22 +45,40 @@ void signal_handler(int signum) {
     g_running = false; // 告诉主循环要退出了，该处理数据落盘与数据库关闭了
 }
 
+// 原来的代码使用 std::signal() 注册 SIGINT / SIGTERM 的处理函数,
+// 在某些 Linux 实现中，signal() 会隐含地给信号动作加上 SA_RESTART 标志，
+// 导致被信号中断的 read()/write()/accept() 等慢系统调用自动重启，
+// read()/write()/accept() 不会返回，程序便会看起来像是卡死在"正在退出状态"。
+void register_signal_handler() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));              // 将整个结构体清零，避免未初始化的字段带来意外行为
+    sa.sa_handler = signal_handler;                  // 设置信号处理函数指针
+    sa.sa_flags = 0;                                 // 关键：将sa_flags设为0，即不设置 SA_RESTART
+    sigaction(SIGINT, &sa, nullptr);  // 用 sigaction 分别注册 SIGINT（Ctrl+C）和 SIGTERM（kill）
+    sigaction(SIGTERM, &sa, nullptr); // 第三个参数为 nullptr，表示不关心旧的信号动作。
+}
+
 // main()函数可以接收接收命令行参数，argc 是参数数量，argv[] 是由空格分隔的参数值的数组。
 int main(int argc, char* argv[]) {
-    // 如果启动时提供了大于等于2个参数（例如 ./kv_worker 8890 有两个参数），
-    // 则将第二个参数，即8890，由字符串转换为整数，并覆盖 WORKER_PORT 的默认值。
-    if (argc >= 2) {
-        WORKER_PORT = std::atoi(argv[1]);
+    // 如果启动时提供了大于等于2个参数（例如 ./slave 0 有两个参数），
+    // 则将第二个参数，即 0，由字符串转换为整数，并覆盖 worker_id 的默认值。
+    if (argc < 2) {
+        std::cerr << "用法: " << argv[0] << " <worker_id (0-2)>" << std::endl;
+        return 1;
+    }
+    worker_id = std::atoi(argv[1]);
+    if (worker_id < 0 || worker_id > 2) {
+        std::cerr << "错误: worker_id 必须在 0~2 之间" << std::endl;
+        return 1;
     }
 
-    // 注册信号处理器
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
+    // 注册信号处理器，其会在收到信号时自动执行一系列操作
+    register_signal_handler();
 
     // 打开 Wisckey 数据库
     // 每个 worker 使用独立的数据库目录，以端口号区分，避免多 worker 数据冲突
     // "./"是相对路径，因此数据库文件存储在 build 目录下
-    std::string db_path = "./wisckey_db_worker_" + std::to_string(WORKER_PORT);
+    std::string db_path = "./wisckey_db_worker_" + std::to_string(worker_id);
 
     leveldb::Options options;
     options.create_if_missing = true;                       // 如果数据库不存在则自动创建
@@ -77,205 +97,311 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     g_db = db; // 将数据库指针赋值给全局变量，供信号处理器使用
-    std::cout << "Worker: Wisckey 数据库已打开, 路径: " << db_path << std::endl;
+    std::cout << "Worker " << worker_id << ": Wisckey 数据库已打开, 路径: " << db_path << std::endl;
 
-    // 与 kv_master 中的 main 函数类似，先创建一个套接字。
-    // 注意：此时 worker 先启动，被动等待 server 链接，这时的 worker 是 server 的 "server" 。
-    int worker_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (worker_fd < 0) {
-        std::cerr << "Worker: socket failed\n";
-        delete db;  // 关闭数据库
-        return 1;
-    }
-
-    int opt = 1;
-    setsockopt(worker_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    // 再准备一个地址+端口，用于和 server 通信。
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(WORKER_PORT);
-
-    // 将套接字与 地址+端口 绑定。
-    if (bind(worker_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "Worker: bind failed on port " << WORKER_PORT << "\n";
-        close(worker_fd);
-        delete db;  // 关闭数据库
-        return 1;
-    }
-
-    // 监听套接字，准备被动接受连接。
-    if (listen(worker_fd, 5) < 0) {
-        std::cerr << "Worker: listen failed\n";
-        close(worker_fd);
-        delete db;
-        return 1;
-    }
-
-    // 打印从节点信息
-    std::cout << "工作节点已启动, worker_fd = " << worker_fd
-              << ", 监听端口: [127.0.0.1:" << WORKER_PORT << "]" << std::endl;
-
-    // 修改：不再使用 std::unordered_map<int, std::string> store
-    // 原版: std::unordered_map<int, std::string> store;  // 内存中的键值存储
-    // 现在所有数据通过 Wisckey 的 db->Put / db->Get / db->Delete 持久化存储
-
-    // 不同于主节点，从节点无需采用epoll轮询方式，因为它只需要处理一个连接（来自主节点的持久连接），不需要同时处理多个客户端连接。
-    while (g_running) { // 不再是死循环，而是检查 g_running 标志
-        // 循环被动等待链接
-        struct sockaddr_in master_addr;
-        socklen_t master_len = sizeof(master_addr);
-        int master_fd = accept(worker_fd, (struct sockaddr*)&master_addr, &master_len);
+    std::cout << "Worker " << worker_id << ": 尝试连接主服务器 " << MASTER_HOST << ":" << MASTER_PORT << " ..." << std::endl;
+    // 从节点主动连接：循环重试直到连接成功
+    int master_fd = -1;
+    while (g_running) {
+        // ---------- 1. 创建空套接字 ----------
+        // 这部分主动与被动连接一致。
+        master_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (master_fd < 0) {
-            if (!g_running) break; // 如果是断开连接，则退出循环
-            std::cerr << "Worker: accept failed\n";
-            continue;              // 如果是其他错误，继续等待新的连接
+            std::cerr << "Worker: socket 创建失败" << std::endl;
+            sleep(1);
+            continue;
         }
 
-        // 打印主服务器连接信息
-        char master_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &master_addr.sin_addr, master_ip, INET_ADDRSTRLEN);
-        int master_port = ntohs(master_addr.sin_port);
-        std::cout << "已连接到服务端主节点, master_fd = " << master_fd
-                  << ", socket = " << master_ip << ":" << master_port << std::endl;
+        // ---------- 2. 准备服务器地址结构 ----------
+        // 主动连接准备的地址说目的地址，即 master 的而非 slave 的。
+        struct sockaddr_in master_addr;
+        memset(&master_addr, 0, sizeof(master_addr));
+        master_addr.sin_family = AF_INET;
+        master_addr.sin_port = htons(MASTER_PORT);
+        // inet_pton() 与 htonl() 功能基本相同，只是为了更灵活地指定 master 地址（可能更改为其他 IP）。
+        if (inet_pton(AF_INET, MASTER_HOST.c_str(), &master_addr.sin_addr) <= 0) {
+            std::cerr << "Worker: 无效的 master IP" << std::endl;
+            close(master_fd);
+            delete db;
+            return 1;
+        }
 
-        // 如果是临时连接(发送数据才建立TCP连接)：只需读取一行，回复，关闭连接
-        // 如果是长连接，则处理逻辑如下，必须循环处理：
-        while (g_running) {
-            char buf[1024] = {0};
-            int n = read(master_fd, buf, sizeof(buf) - 1);
-            if (n <= 0) {
-                if (n == 0)
-                    std::cout << "服务端主节点关闭连接, master_fd = " << master_fd << std::endl;
-                else
-                    std::cerr << "Worker: read error on master_fd = " << master_fd << std::endl;
-                break; // 退出内层循环，准备关闭 master_fd
+        // 主动连接不需要调用 bind()，内核会自动分配一个临时端口并绑定到套接字。
+
+        // ---------- 3. 主动连接到 master ----------
+        // 主动连接使用connect(), 被动连接使用 listen() + accept() 。
+        if (connect(master_fd, (struct sockaddr*)&master_addr, sizeof(master_addr)) < 0) {
+            std::cerr << "Worker: 连接 master 失败, 2秒后重试... (" << strerror(errno) << ")" << std::endl;
+            close(master_fd);
+            sleep(2);
+            continue;
+        }
+        break; // 连接成功
+    }
+    // 退出检查，若在连接时退出则立刻关闭，无需进行以下步骤。
+    if (!g_running) {
+        close(master_fd);
+        delete db;
+        return 0;
+    }
+
+    std::cout << "Worker: 已成功连接到 master, fd = " << master_fd << std::endl;
+
+
+    // 如果是临时连接(发送数据才建立TCP连接)：只需读取一行，回复，关闭连接
+    // 如果是长连接，则处理逻辑如下，必须循环处理：
+    while (g_running) {
+        char buf[1024] = {0};
+        int n = read(master_fd, buf, sizeof(buf) - 1);
+        if (n <= 0) {
+            if (n == 0) {
+                std::cout << "服务端主节点关闭连接, master_fd = " << master_fd << " ，立刻退出" << std::endl;
+                break;  // 连接被对方关闭，正常退出
+            }
+            else {
+                if (errno == EINTR) {  // 被信号中断，不是真正的 I/O 错误
+                    if (!g_running) {
+                        std::cerr << "被退出信号中断，在 master_fd = " << master_fd << " ，立刻退出" << std::endl;
+                        break;    // 退出标志已置位 → 退出循环
+                    }
+                    else {
+                        std::cerr << "被非退出信号中断，在 master_fd = " << master_fd << " ，继续运行" << std::endl;
+                        continue; // 其他信号 → 重新 read
+                    }
+                }
+                else { // 真正的 I/O 错误，处理或跳出
+                    std::cerr << "出现 I/O 错误，在 master_fd = " << master_fd << " ，立刻退出" << std::endl;
+                    break;
+                }
+            }
+        }
+
+        std::string request(buf, n);
+        // 去除末尾换行符
+        while (!request.empty() && (request.back() == '\n' || request.back() == '\r'))
+            request.pop_back();
+
+        std::istringstream iss(request);
+        std::string cmd, arg;
+        iss >> cmd;
+        std::getline(iss, arg);
+        arg = trim(arg);
+
+        // worker 根据 master 发来的二级命令(STORE/FETCH/DELETE/RANGE)进行处理，
+        // 并将响应命令(STORED/VALUE/DELETED/KVPAIR+END)以字符串形式返回给master。
+        std::string response;
+
+        // ==================== STORE：写入数据 ====================
+        if (cmd == "STORE") {
+            // 解析 key 和 value，格式: STORE <key> <value>
+            std::string store_arg = arg;   // arg 已经 trim 过，包含 key 和 value 用空格分隔
+            size_t spc = store_arg.find(' ');
+            if (spc == std::string::npos) {
+                response = "ERROR: STORE requires key and value\n";
+                ssize_t nw = write(master_fd, response.c_str(), response.size());
+                if (nw < 0) {
+                    std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                    break;   // 写失败则终止当前连接的处理循环
+                }
+                std::cerr << "  -> STORE 参数缺失" << std::endl;
+                continue;  // 跳过本次循环
+            }
+            std::string key = trim(store_arg.substr(0, spc));
+            std::string value = trim(store_arg.substr(spc + 1));
+            if (key.empty() || value.empty()) {
+                response = "ERROR: STORE requires key and value\n";
+                ssize_t nw = write(master_fd, response.c_str(), response.size());
+                if (nw < 0) {
+                    std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                    break;   // 写失败则终止当前连接的处理循环
+                }
+                std::cerr << "  -> STORE 的 key 或 value 为空" << std::endl;
+                continue;
             }
 
-            std::string request(buf, n);
-            // 去除末尾换行符
-            while (!request.empty() && (request.back() == '\n' || request.back() == '\r'))
-                request.pop_back();
+            std::cout << "收到 STORE 请求: key = \"" << key
+                        << "\", value = \"" << value << "\"" << std::endl;
 
-            std::istringstream iss(request);
-            std::string cmd, arg;
-            iss >> cmd;
-            std::getline(iss, arg);
-            arg = trim(arg);
+            // 持久化写入
+            // sync 字段用于控制当 leveldb 将数据写入到预写日志时，是否同步地调用 fsync() 将内核缓冲区中的数据 flush 到硬盘。
+            leveldb::WriteOptions write_opts;
+            write_opts.sync = true;
+            leveldb::Status put_status = db->Put(write_opts, key, value);
 
-            // worker 根据 master 发来的二级命令(STORE/FETCH/DELETE)进行处理，
-            // 并将响应命令(STORED/VALUE/DELETED)以字符串形式返回给master。
-            std::string response;
+            if (put_status.ok()) {
+                // PUT 成功，返回 STORED 响应，无需返回参数 id ，因为id与key一样，主节点直接存key即可。
+                response = "STORED\n";
+                std::cout << "  -> 已存储为 id = " << key << std::endl;
+            } else {
+                response = "ERROR store failed\n";
+                std::cerr << "  -> Wisckey Put 失败: " << put_status.ToString() << std::endl;
+            }
+            ssize_t nw = write(master_fd, response.c_str(), response.size());
+            if (nw < 0) {
+                std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                break;   // 写失败则终止当前连接的处理循环
+            }
 
-            // ==================== STORE：写入数据 ====================
-            if (cmd == "STORE") {
-                // 解析 key 和 value，格式: STORE <key> <value>
-                std::string store_arg = arg;   // arg 已经 trim 过，包含 key 和 value 用空格分隔
-                size_t spc = store_arg.find(' ');
-                if (spc == std::string::npos) {
-                    response = "ERROR: STORE requires key and value\n";
-                    write(master_fd, response.c_str(), response.size());
-                    std::cerr << "  -> STORE 参数缺失" << std::endl;
-                    continue;  // 跳过本次循环
+        // ==================== FETCH：读取数据 ====================
+        } else if (cmd == "FETCH") {
+            // 无需解析 key ，格式: FETCH <id>，上方自动解析出的arg就是id，无需再解析
+            // 使用 Wisckey 的 Get 接口替代内存 map 查找
+            std::cout << "收到 FETCH 请求: id = " << arg << std::endl;
+
+            std::string value;
+            leveldb::Status get_status = db->Get(leveldb::ReadOptions(), arg, &value);
+            if (get_status.ok()) {
+                // 键存在，返回值
+                response = "VALUE " + value + "\n";
+                ssize_t nw = write(master_fd, response.c_str(), response.size());
+                if (nw < 0) {
+                    std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                    break;
                 }
-                std::string key = trim(store_arg.substr(0, spc));
-                std::string value = trim(store_arg.substr(spc + 1));
-                if (key.empty() || value.empty()) {
-                    response = "ERROR: STORE requires key and value\n";
-                    write(master_fd, response.c_str(), response.size());
-                    std::cerr << "  -> key 或 value 为空" << std::endl;
-                    continue;
+                std::cout << "  -> 返回值: \"" << value << "\" " << std::endl;
+            } else if (get_status.IsNotFound()) {
+                // Wisckey 中未找到该键
+                response = "NOT_FOUND\n";
+                ssize_t nw = write(master_fd, response.c_str(), response.size());
+                if (nw < 0) {
+                    std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                    break;
                 }
+                std::cout << "  -> 未找到 id " << std::endl;
+            } else {
+                // 其他读取错误
+                response = "ERROR fetch failed\n";
+                ssize_t nw = write(master_fd, response.c_str(), response.size());
+                if (nw < 0) {
+                    std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                    break;
+                }
+                std::cerr << "  -> Wisckey Get 错误: " << get_status.ToString() << std::endl;
+            }
 
-                std::cout << "收到 STORE 请求: key = \"" << key
-                          << "\", value = \"" << value << "\"" << std::endl;
+        // ==================== DELETE：删除数据 ====================
+        } else if (cmd == "DELETE") {
+            // 使用 Wisckey 的 Get + Delete 接口替代内存 map 删除 =====
+            // 现在: 先用 db->Get() 检查键是否存在，再用 db->Delete() 删除
+            // 注：Wisckey 的 Delete 不会在键不存在时返回错误，
+            //     但为兼容原有协议（区分 DELETED / NOT_FOUND），先做存在性检查
+            std::cout << "收到 DELETE 请求: id = " << arg << std::endl;
 
-                // 持久化写入
-                // sync 字段用于控制当 leveldb 将数据写入到预写日志时，是否同步地调用 fsync() 将内核缓冲区中的数据 flush 到硬盘。
+            std::string value;
+            leveldb::Status get_status = db->Get(leveldb::ReadOptions(), arg, &value);
+            if (get_status.ok()) { // 键存在
+                // 使用 sync=true 确保删除操作持久化
                 leveldb::WriteOptions write_opts;
                 write_opts.sync = true;
-                leveldb::Status put_status = db->Put(write_opts, key, value);
 
-                if (put_status.ok()) {
-                    // PUT 成功，返回 STORED 响应，无需返回参数 id ，因为id与key一样，主节点直接存key即可。
-                    response = "STORED\n";
-                    std::cout << "  -> 已存储为 id = " << key << " (Wisckey持久化)" << std::endl;
-                } else {
-                    response = "ERROR store failed\n";
-                    std::cerr << "  -> Wisckey Put 失败: " << put_status.ToString() << std::endl;
-                }
-                write(master_fd, response.c_str(), response.size());
-
-            // ==================== FETCH：读取数据 ====================
-            } else if (cmd == "FETCH") {
-                // 使用 Wisckey 的 Get 接口替代内存 map 查找
-                std::cout << "收到 FETCH 请求: id = " << arg << std::endl;
-
-                std::string value;
-                leveldb::Status get_status = db->Get(leveldb::ReadOptions(), arg, &value);
-                if (get_status.ok()) {
-                    // 键存在，返回值
-                    response = "VALUE " + value + "\n";
-                    write(master_fd, response.c_str(), response.size());
-                    std::cout << "  -> 返回值: \"" << value << "\" (Wisckey)" << std::endl;
-                } else if (get_status.IsNotFound()) {
-                    // Wisckey 中未找到该键
-                    response = "NOT_FOUND\n";
-                    write(master_fd, response.c_str(), response.size());
-                    std::cout << "  -> 未找到 id (Wisckey IsNotFound)" << std::endl;
-                } else {
-                    // 其他读取错误
-                    response = "ERROR fetch failed\n";
-                    write(master_fd, response.c_str(), response.size());
-                    std::cerr << "  -> Wisckey Get 错误: " << get_status.ToString() << std::endl;
-                }
-
-            // ==================== DELETE：删除数据 ====================
-            } else if (cmd == "DELETE") {
-                // 使用 Wisckey 的 Get + Delete 接口替代内存 map 删除 =====
-                // 现在: 先用 db->Get() 检查键是否存在，再用 db->Delete() 删除
-                // 注：Wisckey 的 Delete 不会在键不存在时返回错误，
-                //     但为兼容原有协议（区分 DELETED / NOT_FOUND），先做存在性检查
-                std::cout << "收到 DELETE 请求: id = " << arg << std::endl;
-
-                std::string value;
-                leveldb::Status get_status = db->Get(leveldb::ReadOptions(), arg, &value);
-                if (get_status.ok()) { // 键存在
-                    // 使用 sync=true 确保删除操作持久化
-                    leveldb::WriteOptions write_opts;
-                    write_opts.sync = true;
-
-                    // 键存在，执行删除
-                    leveldb::Status del_status = db->Delete(write_opts, arg);
-                    if (del_status.ok()) { // 删除成功
-                        response = "DELETED\n";
-                        write(master_fd, response.c_str(), response.size());
-                        std::cout << "  -> 已删除 id = " << arg << " (Wisckey)" << std::endl;
-                    } else { // 删除操作发生失败
-                        response = "ERROR delete failed\n";
-                        write(master_fd, response.c_str(), response.size());
-                        std::cerr << "  -> Wisckey Delete 失败: " << del_status.ToString() << std::endl;
+                // 键存在，执行删除
+                leveldb::Status del_status = db->Delete(write_opts, arg);
+                if (del_status.ok()) { // 删除成功
+                    response = "DELETED\n";
+                    ssize_t nw = write(master_fd, response.c_str(), response.size());
+                    if (nw < 0) {
+                        std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                        break;
                     }
-                } else if (get_status.IsNotFound()) { // 键不存在
-                    response = "NOT_FOUND\n";
-                    write(master_fd, response.c_str(), response.size());
-                    std::cout << "  -> 未找到 id, 无法删除 (Wisckey)" << std::endl;
-                } else { // GET操作发生错误
-                    response = "ERROR delete check failed\n";
-                    write(master_fd, response.c_str(), response.size());
-                    std::cerr << "  -> Wisckey Get 检查错误: " << get_status.ToString() << std::endl;
+                    std::cout << "  -> 已删除 id = " << arg << std::endl;
+                } else { // 删除操作发生失败
+                    response = "ERROR delete failed\n";
+                    ssize_t nw = write(master_fd, response.c_str(), response.size());
+                    if (nw < 0) {
+                        std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                        break;
+                    }
+                    std::cerr << "  -> Wisckey Delete 失败: " << del_status.ToString() << std::endl;
                 }
-
-            } else {
-                response = "ERROR\n";
-                write(master_fd, response.c_str(), response.size());
-                std::cout << "收到未知命令: " << cmd << std::endl;
+            } else if (get_status.IsNotFound()) { // 键不存在
+                response = "NOT_FOUND\n";
+                ssize_t nw = write(master_fd, response.c_str(), response.size());
+                if (nw < 0) {
+                    std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                    break;
+                }
+                std::cout << "  -> 未找到 id, 无法删除 " << std::endl;
+            } else { // GET操作发生错误
+                response = "ERROR delete check failed\n";
+                ssize_t nw = write(master_fd, response.c_str(), response.size());
+                if (nw < 0) {
+                    std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                    break;
+                }
+                std::cerr << "  -> Wisckey Get 检查错误: " << get_status.ToString() << std::endl;
             }
+
+        // ==================== RANGE：范围查询 ====================
+        } else if (cmd == "RANGE") {
+            // 解析 start_key 和 end_key，格式: RANGE <start_key> <end_key>
+            std::string range_arg = arg;   // arg 已经 trim 过
+            size_t spc = range_arg.find(' ');
+            if (spc == std::string::npos) {
+                response = "ERROR: RANGE requires start_key and end_key\n";
+                ssize_t nw = write(master_fd, response.c_str(), response.size());
+                if (nw < 0) {
+                    std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                    break;   // 写失败则终止当前连接的处理循环
+                }
+                std::cerr << "  -> RANGE 参数缺失" << std::endl;
+                continue;
+            }
+            std::string start_key = trim(range_arg.substr(0, spc));
+            std::string end_key = trim(range_arg.substr(spc + 1));
+            if (start_key.empty() || end_key.empty()) {
+                response = "ERROR: RANGE requires start_key and end_key\n";
+                ssize_t nw = write(master_fd, response.c_str(), response.size());
+                if (nw < 0) {
+                    std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                    break;   // 写失败则终止当前连接的处理循环
+                }
+                std::cerr << "  -> RANGE 的 start_key 或 end_key 为空" << std::endl;
+                continue;
+            }
+
+            std::cout << "收到 RANGE 请求: start = \"" << start_key
+                        << "\", end = \"" << end_key << "\"" << std::endl;
+
+            // 使用 Wisckey 迭代器进行有序范围扫描, 远比一个个 GET 效率来得快.
+            leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+            int sent_count = 0;
+            // 阻塞扫描并发送所有区间内键值对
+            for (it->Seek(start_key); it->Valid() && it->key().ToString() <= end_key; it->Next()) {
+                response = "KVPAIR " + it->key().ToString() + " " + it->value().ToString() + "\n";
+                ssize_t nw = write(master_fd, response.c_str(), response.size());
+                if (nw < 0) {
+                    std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                    break;
+                }
+                sent_count++;
+            }
+
+            if (!it->status().ok()) {
+                std::cerr << "  -> RANGE 迭代出错: " << it->status().ToString() << std::endl;
+            }
+            delete it;
+
+            // 无论是否有结果，都必须以 END 结束，为了告诉主节点"我已发送完毕"
+            std::string end_response = "END\n";
+            ssize_t nw = write(master_fd, end_response.c_str(), end_response.size());
+            if (nw < 0) {
+                std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                break;
+            }
+            std::cout << "  -> RANGE 完成，发送了 " << sent_count << " 条 KVPAIR" << std::endl;
+            // 注：这里不设置 response，因为响应已经在循环中直接发送，最后只需 END
+
+        } else {
+            response = "ERROR\n";
+            ssize_t nw = write(master_fd, response.c_str(), response.size());
+            if (nw < 0) {
+                std::cerr << " 向 master 写入失败 " << strerror(errno) << std::endl;
+                break;
+            }
+            std::cout << "收到未知命令: " << cmd << std::endl;
         }
-        close(master_fd);
     }
+    close(master_fd);
 
     // 以上不再是死循环，可以执行到此步，安全关闭数据库
     // delete db 会将 memtable 中的数据刷盘为 SSTable 并更新 MANIFEST
@@ -283,7 +409,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Slave: 正在关闭 Wisckey 数据库..." << std::endl;
     delete db;  // 关闭 Wisckey 数据库
     g_db = nullptr;
-    close(worker_fd);
     std::cout << "Slave: 已安全退出" << std::endl;
     return 0;
 }

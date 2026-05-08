@@ -16,6 +16,8 @@
 #include <algorithm>     // std::find_if_not, std::isspace
 #include <vector>        // std::vector
 #include <csignal>       // signal() 处理退出信号
+#include <utility>       // std::pair
+#include <sstream>       // std::istringstream
 
 // 引入 Wisckey 的头文件
 #include "leveldb/db.h"
@@ -24,10 +26,10 @@
 #include "leveldb/slice.h"
 #include "leveldb/iterator.h"
 
-const int MAX_EVENTS = 64;          // 最多可容纳的epoll事件数
-const int PORT = 8888;              // master 端口常量
-const int WORKER_PORT_BASE = 8889;  // worker 端口起始常量，n 个 worker 端口的为 8889 + n
-const int WORKER_COUNT = 3;         // worker 数量
+const int MAX_EVENTS = 64;           // 最多可容纳的epoll事件数
+const int MASTER_CLIENT_PORT = 8888; // master 的连接 client 的端口常量
+const int MASTER_WORKER_PORT = 8889; // master 的连接 worker 的端口常量
+const int WORKER_COUNT = 3;          // worker 数量
 
 // 为支持多从节点，将单个 g_worker_fd 改为用 vector 存储多个 g_worker_fd
 std::vector<int> g_worker_fds;       // 存储所有 worker 连接的文件描述符
@@ -94,45 +96,6 @@ static ValueLocation deserialize_value_location(const std::string& s) {
         loc.value_id = s.substr(colon_pos + 1);
     }
     return loc;
-}
-
-// 连接到端口为 port 的 worker 并返回套接字（阻塞模式，简单可靠）// TODO 改为非阻塞模式
-int connect_to_worker(int port) {
-    // 注：这里是主动连接，与main函数中的被动连接相似却有所区别。
-    // 先创建一个套接字。
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        std::cerr << "连接 worker 失败: socket 创建错误" << std::endl;
-        return -1;
-    }
-
-    // 再准备一个地址+端口记为 addr ，注：这是 worker 的地址+端口，用于主动连接到 worker 。
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(port);
-
-    // 主节点会随机分配一个端口，主动连接到地址 addr ,这里的 addr 就是上面准备好的 worker 的地址+端口。
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "连接 worker 失败: connect 错误" << std::endl;
-        close(sock);
-        return -1;
-    }
-
-    // 获取并打印连接信息
-    struct sockaddr_in worker_addr;
-    socklen_t len = sizeof(worker_addr);
-    char ip[INET_ADDRSTRLEN];
-    int worker_port = 0;
-    if (getpeername(sock, (struct sockaddr*)&worker_addr, &len) == 0) {
-        inet_ntop(AF_INET, &worker_addr.sin_addr, ip, sizeof(ip));
-        worker_port = ntohs(worker_addr.sin_port);
-    }
-    std::cout << "已建立到工作节点的持久连接, worker_fd = " << sock
-              << ", socket = " << ip << ":" << worker_port << std::endl;
-
-    return sock;
 }
 
 // 向指定的 worker 发送 STORE 请求，返回存储的内部 ID（字符串形式）
@@ -244,20 +207,73 @@ bool delete_on_worker(int worker_index, const std::string& id_str) {
     return false; // 找到NOT_FOUND响应，说明删除失败
 }
 
-// 根据 key 的首字符，采用 Range 分区策略分配 worker 索引
-// 分区规则：
-//   Worker 0: 首字符为 'a'..'i' 或 'A'..'I' 或 '0'..'4'
-//   Worker 1: 首字符为 'j'..'r' 或 'J'..'R' 或 '5'..'9'
-//   Worker 2: 其他所有字符（包括 's'..'z', 'S'..'Z', 特殊符号等）
+// 向指定的 worker 发送 RANGE <start> <end> 请求，返回该区间内所有键值对列表 vector<pair<key, value>>
+std::vector<std::pair<std::string, std::string>> range_scan_worker(int worker_index, const std::string& start, const std::string& end) {
+    std::vector<std::pair<std::string, std::string>> results;
+    // 如果 worker_index 小于0 ，或大于等于容器 g_worker_fds 的大小，即正常连接的worker数，说明连接无效。
+    if (worker_index < 0 || worker_index >= (int)g_worker_fds.size()) return results;
+    // 从 g_worker_fds 中获取对应 worker 的文件描述符
+    int worker_fd = g_worker_fds[worker_index];
+    if (worker_fd < 0) return results;
+
+    std::string request = "RANGE " + start + " " + end + "\n";
+    ssize_t n = write(worker_fd, request.c_str(), request.size());
+    if (n <= 0) {
+        std::cerr << "向 worker (index=" << worker_index << ") 写入 RANGE 请求失败" << std::endl;
+        return results;
+    }
+
+    // 循环读取直到收到来自 worker 的 "END\n" // TODO 改为非阻塞模式
+    std::string recv_buf;
+    char buf[1024]; // 可能会被写满，但我们会循环读取直到 "END\n" 出现。
+    while (true) {
+        // 读取 worker 发回的 KVPAIR 响应命令。
+        n = read(worker_fd, buf, sizeof(buf) - 1); // 同主函数中一样，read 必须指定一个已初始化的缓冲区，也就是 buf
+        if (n <= 0) {
+            std::cerr << "从 worker (index=" << worker_index << ") 读取 RANGE 响应失败" << std::endl;
+            break;
+        }
+        recv_buf.append(buf, n); // 再将 buf 中的数据放入 recv_buf 中，同时转换为字符串状态。
+        // 查找到 "END\n" 的位置
+        size_t end_pos = recv_buf.find("END\n");
+        if (end_pos != std::string::npos) {
+            // 取出 END 之前的所有数据，并移除已处理部分
+            std::string data = recv_buf.substr(0, end_pos); // 提取 "END\n" 之前的所有数据到 data 字符串中
+            recv_buf.erase(0, end_pos + 4);                 // 清空 recv_buf 中已处理的部分，保留 "END\n" 之后的数据（如果有的话）
+            // 按行解析，每行的格式为"KVPAIR <key> <value>"
+            std::istringstream iss(data);  // 创建一个输入字符串流对象 iss，以便逐行读取 data 的内容
+            std::string line;                  // 定义一个字符串 line，用于存储从流中读出的每一行文本
+            while (std::getline(iss, line)) { // 循环：每次从 iss 中读取一行放入 line
+                if (line.empty()) continue; // 跳过可能的空行
+                if (line.compare(0, 7, "KVPAIR ") == 0) { // 判断该行是否以 "KVPAIR " 开头
+                    std::string kv_part = line.substr(7); // 跳过 "KVPAIR " 开始提取余下的子串，得到key value部分
+                    size_t sep = kv_part.find(' '); // 找到第一个空格，依此分离 key 和 value
+                    if (sep != std::string::npos) {
+                        std::string key = kv_part.substr(0, sep);
+                        std::string value = kv_part.substr(sep + 1);
+                        results.emplace_back(key, value); // 在 results 容器的末尾添加该键值对元素
+                    }
+                }
+            }
+            break;
+        }
+    }
+    return results;
+}
+
+// 根据 key 的首字符，采用 ASCII 均分 Range 分区策略分配 worker 索引
+// Worker 0: 首字符 ASCII 0 ~ 42  : 从 空字符(0) 到 '*' (42)
+// Worker 1: 首字符 ASCII 43 ~ 85 : 从 '+' (43) 到 'U' (85)
+// Worker 2: 首字符 ASCII 86 ~ 127: 从 'V' (86) 到 DEL (127)
 // TODO 改为动态分区策略
 int get_worker_for_key(const std::string& key) {
-    if (key.empty()) return 0; // 健壮性保护，调用方应已保证非空
-    unsigned char ch = key[0];
-    if ((ch >= 'a' && ch <= 'i') || (ch >= 'A' && ch <= 'I') || (ch >= '0' && ch <= '4')) {
+    if (key.empty()) return 0; // 健壮性保护
+    unsigned char ch = static_cast<unsigned char>(key[0]);
+    if (ch >= 0 && ch <= 42) {
         return 0;
-    } else if ((ch >= 'j' && ch <= 'r') || (ch >= 'J' && ch <= 'R') || (ch >= '5' && ch <= '9')) {
+    } else if (ch >= 43 && ch <= 85) {
         return 1;
-    } else {
+    } else { // 任何其它字符，如中文字符，会进入 worker2
         return 2;
     }
 }
@@ -362,7 +378,7 @@ std::string process_command(const std::string& line) {
         if (it != kv_store.end()) {
             std::string value = fetch_from_worker(it->second.worker_index, it->second.value_id);
             if (value.empty()) {
-                return "ERROR: value not found on worker\r\n"; // !可能在worker中以将值删除，但是master中的键与路由条目未被删除时出现此报错,请确保操作原子完成、数据已落盘。
+                return "ERROR: value not found on worker\r\n"; // !可能在worker中已将值删除，但是master中的键与路由条目未被删除时出现此报错,请确保操作原子完成、数据已落盘。
             }
             return "VALUE " + value + "\r\n";                  // 在找到值得时候出现此回复
         } else {
@@ -411,8 +427,48 @@ std::string process_command(const std::string& line) {
         } else {
             return "NOT FOUND\r\n";
         }
+
+    // ==================== SCAN：高效范围查询 ====================
+    // * 总而言之：直接向所有从节点发送"扫描"请求，将所有结果合并后返回给客户端。
+    } else if (cmd == "SCAN") {
+        // 解析 first_key 和 last_key，格式：SCAN <first_key> <last_key>
+        std::string keys_arg = trim(arg);
+        size_t sep = keys_arg.find(' ');
+        // 如果没有找到空格，说明缺少两个参数，返回错误提示
+        if (sep == std::string::npos) {
+            return "ERROR: SCAN requires first_key and last_key\r\n";
+        }
+        std::string first_key = trim(keys_arg.substr(0, sep));
+        std::string last_key = trim(keys_arg.substr(sep + 1));
+        // 如果任一键为空，说明缺少一个参数，返回错误提示
+        if (first_key.empty() || last_key.empty()) {
+            return "ERROR: SCAN requires first_key and last_key\r\n";
+        }
+        // 如果 <first_key> 大于 <last_key>，说明参数顺序错误，返回错误提示
+        if (first_key > last_key) {
+            return "ERROR: SCAN first_key must be <= last_key\r\n";
+        }
+
+        // 计算可能涉及的 worker 索引范围
+        int start_worker = get_worker_for_key(first_key);
+        int end_worker = get_worker_for_key(last_key);
+        // 调用 range_scan_worker，扫描可能的 worker 的区间内键值对到 all_pairs 列表中
+        std::vector<std::pair<std::string, std::string>> all_pairs;
+        for (int i = start_worker; i <= end_worker; ++i) {
+            auto pairs = range_scan_worker(i, first_key, last_key); // 存储单个worker扫描的结果
+            all_pairs.insert(all_pairs.end(), pairs.begin(), pairs.end()); // 存储所有扫描的结果
+        }
+
+        // 将键值对列表 all_pairs 转换为一整个字符串，以便向客户端发送。
+        std::string result;
+        for (const auto& kv : all_pairs) {
+            result += kv.first + " " + kv.second + "\r\n";
+        }
+        result += "END\r\n";
+        return result;
+
     } else {
-        return "ERROR: Unknown command. Use PUT <value> or GET <key> or DELETE <key>\r\n";
+        return "ERROR: Unknown command. Use PUT <value> or GET <key> or DELETE <key> or SCAN <first_key> <last_key>\r\n";
     }
 }
 
@@ -462,90 +518,154 @@ int main() {
     std::cout << "Master: 从 Wisckey 恢复了 " << recovered_count << " 条路由记录" << std::endl;
 
     // ---------- 1. 创建空套接字 ----------
-    // 返回值: 一个非负整数，称为"套接字文件描述符"，失败返回 -1。
-    int master_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (master_fd < 0) {
-        std::cerr << "创建套接字失败" << std::endl;
+    // socket()返回值: 失败返回 -1，成功返回一个非负整数，称为"套接字文件描述符"，
+    // 即"file descriptor"，通常被写作 _fd ，用于标志一个套接字。
+
+    // 连接到客户端的：// TODO 修改命名
+    int master_client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (master_client_fd < 0) {
+        std::cerr << "创建 master_client 套接字失败" << std::endl;
         delete g_meta_db; //关闭数据库
         return 1;
     }
-    // 设置端口复用（方便调试，避免"Address already in use"）
-    int opt = 1;
-    setsockopt(master_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // 设置端口复用（方便调试，避免"Address already in use"，注：端口复用不会影响吞吐量）
+    int opt_c = 1;
+    setsockopt(master_client_fd, SOL_SOCKET, SO_REUSEADDR, &opt_c, sizeof(opt_c));
+
+    // 连接到从节点的：
+    int master_worker_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (master_worker_fd < 0) {
+        std::cerr << "创建 master_worker 套接字失败" << std::endl;
+        delete g_meta_db;
+        return 1;
+    }
+    int opt_w = 1;
+    setsockopt(master_worker_fd, SOL_SOCKET, SO_REUSEADDR, &opt_w, sizeof(opt_w));
 
     // ---------- 2. 准备服务器地址结构 ----------
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
+    // 作用：设置地址的 IP:Port 结构，一遍接下来与套接字关联
+
+    // 连接到客户端的：
+    struct sockaddr_in master_client_addr;
+    memset(&master_client_addr, 0, sizeof(master_client_addr));
     // 使用 IPv4
-    server_addr.sin_family = AF_INET;
+    master_client_addr.sin_family = AF_INET;
     // INADDR_LOOPBACK 是一个宏，值对应 127.0.0.1 (回环地址)。
-    // htonl() 将主机字节序（小端）的 32 位整数转换成网络字节序（大端）。
-    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    // htons() 将主机字节序（小端）的 16 位整数转换成网络字节序（大端）。
+    // htonl() 将"主机字节序（小端）"的 32 位整数转换成"网络字节序（大端）"。
+    master_client_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // htons() 将"主机字节序（小端）"的 16 位整数转换成"网络字节序（大端）"。
     // 8888 是任意选择的端口号，只要大于 1024（避免与系统服务冲突）。
-    server_addr.sin_port = htons(PORT);
+    master_client_addr.sin_port = htons(MASTER_CLIENT_PORT);
+
+    // 连接到从节点的：
+    struct sockaddr_in master_worker_addr;
+    memset(&master_worker_addr, 0, sizeof(master_worker_addr));
+    master_worker_addr.sin_family = AF_INET;
+    master_worker_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    master_worker_addr.sin_port = htons(MASTER_WORKER_PORT);
 
     // ---------- 3. 绑定地址到套接字 ----------
     // 作用: 将套接字与上述创建的 IP 地址和端口关联起来。服务器必须绑定，
     //       否则客户端不知道应该连接到哪里。
-    if (bind(master_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+
+    // 连接到客户端的：
+    if (bind(master_client_fd, (struct sockaddr*)&master_client_addr, sizeof(master_client_addr)) < 0) {
         std::cerr << "绑定地址失败" << std::endl;
-        close(master_fd); // 失败后关闭套接字，释放资源
+        close(master_client_fd); // 失败后关闭套接字，释放资源
         delete g_meta_db;    // 失败后关闭数据库
+        return 1;
+    }
+
+    // 连接到从节点的：
+    if (bind(master_worker_fd, (struct sockaddr*)&master_worker_addr, sizeof(master_worker_addr)) < 0) {
+        std::cerr << "绑定 worker 监听地址失败" << std::endl;
+        close(master_worker_fd);
+        delete g_meta_db;
         return 1;
     }
 
     // ---------- 4. 开始监听端口 ----------
     // 作用: 将套接字从主动模式变成被动模式，告诉操作系统开始接收客户端的连接请求。
-    if (listen(master_fd, 128) < 0) { // 128 是等待连接队列长度
-        std::cerr << "监听失败" << std::endl;
-        close(master_fd);
+
+    // 连接到客户端的：
+    if (listen(master_client_fd, 128) < 0) { // 128 是等待连接队列长度
+        std::cerr << "监听 client 端口失败" << std::endl;
+        close(master_client_fd);
         delete g_meta_db;
         return 1;
     }
-    std::cout << "主服务器已启动, master_fd = " << master_fd
-              << ", 监听端口: [127.0.0.1:" << PORT << "]"
+    std::cout << "被动监听客户端通道已建立, master_client_fd = " << master_client_fd
+              << ", socket: [127.0.0.1:" << MASTER_CLIENT_PORT << "]"
               << " (epoll ET 模式) " << std::endl;
 
-    // ---------- 5. 创建 epoll 实例 ----------
-    // epoll_fd 会占用 4 这个值。
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) {
-        std::cerr << "创建 epoll 失败" << std::endl;
-        close(master_fd);
+    // 连接到从节点的：
+    if (listen(master_worker_fd, 5) < 0) {
+        std::cerr << "监听 master_worker 端口失败" << std::endl;
+        close(master_worker_fd);
         delete g_meta_db;
         return 1;
     }
+    std::cout << "被动监听从节点通道已建立, master_worker_fd = " << master_worker_fd
+              <<", socket: [127.0.0.1:" << MASTER_WORKER_PORT << "]"
+              << std::endl;
 
-    // ---------- 6. 启动时立即连接到所有 worker (长连接) ----------
-    for (int i = 0; i < WORKER_COUNT; ++i) {
-        int worker_port = WORKER_PORT_BASE + i;
-        int fd = connect_to_worker(worker_port);
-        if (fd < 0) {
-            std::cerr << "无法连接到工作节点 (端口 " << worker_port << ")，退出" << std::endl;
-            // 简单起见，直接退出；// TODO 健壮性优化可考虑重试或降级
-            close(epoll_fd);
-            close(master_fd);
+    // ---------- 5. 阻塞连接从节点 ----------
+    // 作用：等待所有三个从节点发来的主动连接，并将每个连接的文件描述符保存。
+    // 循环直到三个从节点全部加入
+    while (g_worker_fds.size() < static_cast<size_t>(WORKER_COUNT)) {
+        if (!g_running) {
+            close(master_worker_fd);
+            delete g_meta_db;
+            return 0;
+        }
+        // 尝试接收新的连接，若接收成功，为该连接分配一个文件描述符
+        struct sockaddr_in slave_addr;
+        socklen_t slave_len = sizeof(slave_addr);
+        int slave_fd = accept(master_worker_fd, (struct sockaddr*)&slave_addr, &slave_len);
+        if (slave_fd < 0) {
+            if (errno == EINTR) continue;
+            std::cerr << "accept slave 连接失败" << std::endl;
+            close(master_worker_fd);
             delete g_meta_db;
             return 1;
         }
-        g_worker_fds.push_back(fd); //将成功连接的 worker 文件描述符存入全局容器中
+        // 将连接到的从节点的文件描述符存入数组
+        g_worker_fds.push_back(slave_fd);
+        // 不为 slave_fd 设置 set_nonblocking 非阻塞模式，因为读写函数用的是阻塞的 write/read 。
+        // 打印从节点信息
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &slave_addr.sin_addr, ip, sizeof(ip));
+        int port = ntohs(slave_addr.sin_port);
+        std::cout << "工作节点已连接, slave_fd = " << slave_fd << ", worker_index = " << (g_worker_fds.size() - 1)
+                << ", socket = " << ip << ":" << port << std::endl;
     }
+    std::cout << "已连接到全部 " << WORKER_COUNT << " 个工作节点，关闭 master_worker 监听套接字" << std::endl;
+    close(master_worker_fd); // TODO　改为永不关闭，置入epoll监视，以便断开后可重连。
 
-    // ---------- 7. 将监听套接字加入 epoll 监视列表 ----------
-    // 将服务端的套接字（监听套接字）加入监视列表，这样当有新的客户端连接到该端口时，epoll_wait 就会通知我们。
-    struct epoll_event ev;
-    ev.events = EPOLLIN;       // 水平LT触发，监听可读。（监听套接字不必使用ET模式，因为新连接事件用LT更简单）
-    ev.data.fd = master_fd;    // 我们只存 fd，也可以存指针
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, master_fd, &ev) < 0) {
-        std::cerr << "添加服务端监听套接字到 epoll 失败" << std::endl;
-        close(epoll_fd);
-        close(master_fd);
+    // ---------- 6. 创建 epoll 实例 ----------
+    // 注：epoll_fd 会占用 4 这个值。
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        std::cerr << "创建 epoll 失败" << std::endl;
+        close(master_client_fd);
         delete g_meta_db;
         return 1;
     }
 
-    // ---------- 8. 循环读取客户端发来的数据或链接 ----------
+    // ---------- 7. 将客户端监听套接字加入 epoll 监视列表 ----------
+    // 将服务端的客户端套接字（监听套接字）加入监视列表，这样当有新的客户端连接到该端口时，epoll_wait 就会通知我们。
+    struct epoll_event ev;
+    ev.events = EPOLLIN;       // 水平LT触发，监听可读。（监听套接字不必使用ET模式，因为新连接事件用LT更简单）
+    ev.data.fd = master_client_fd;    // 我们只存 fd，也可以存指针
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, master_client_fd, &ev) < 0) {
+        std::cerr << "添加服务端的客户端监听套接字到 epoll 失败" << std::endl;
+        close(epoll_fd);
+        close(master_client_fd);
+        delete g_meta_db;
+        return 1;
+    }
+
+    // ---------- 8. 循环读取客户端发来的链接或数据 ----------
     struct epoll_event events[MAX_EVENTS];
     while (g_running) {
         // 等待事件发生，timeout超时 -1 表示一直阻塞, 0 表示立即返回，正数表示等待指定毫秒数后返回。
@@ -563,10 +683,11 @@ int main() {
             int fd = events[i].data.fd;
 
             // ---- 8.1 如果就绪的是服务端监听套接字：有新的客户端连接 ----
-            if (fd == master_fd) {
+            if (fd == master_client_fd) {
+                // 尝试接收新的连接，若接收成功，为该连接分配一个文件描述符
                 struct sockaddr_in client_addr;
                 socklen_t client_len = sizeof(client_addr);
-                int client_fd = accept(master_fd, (struct sockaddr*)&client_addr, &client_len);
+                int client_fd = accept(master_client_fd, (struct sockaddr*)&client_addr, &client_len);
                 if (client_fd < 0) {
                     // 如果资源不可用，此时errno会被设置成 EAGAIN 或 EWOULDBLOCK（在Linux上两者一致)
                     // 在这里指 accept() 后没有新连接，此时不应视为错误，而是等待epoll再次通知
@@ -723,7 +844,7 @@ int main() {
     std::cout << "Master: 正在关闭 Wisckey 元数据库..." << std::endl;
     for (int fd : g_worker_fds) close(fd);
     close(epoll_fd);
-    close(master_fd);
+    close(master_client_fd);
     delete g_meta_db;  // 关闭 Wisckey 元数据库。delete db 时会将 memtable 中的数据刷盘
     g_meta_db = nullptr;
     std::cout << "Master: 已安全退出" << std::endl;

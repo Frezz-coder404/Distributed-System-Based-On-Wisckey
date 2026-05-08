@@ -296,7 +296,7 @@ add_executable(leveldbutil
 )
 target_link_libraries(leveldbutil leveldb)
 
-# ===== 新增：编译分布式 KV 系统的 Master 和 Slave =====
+# ===== 新增：编译分布式 KV 系统的 Master 和 Slave 和 Client =====
 add_executable(master "distributed/master.cc")
 target_link_libraries(master leveldb)
 target_compile_definitions(master
@@ -322,6 +322,9 @@ if (NOT HAVE_CXX17_HAS_INCLUDE)
       LEVELDB_HAS_PORT_CONFIG_H=1
   )
 endif(NOT HAVE_CXX17_HAS_INCLUDE)
+
+add_executable(client "distributed/client.cc")
+# ===================================================
 
 if(LEVELDB_BUILD_TESTS)
   enable_testing()
