@@ -9,3 +9,13 @@ out/
 cmake-build-debug
 cmake-build-release
 .idea
+
+# Additional project ignores.
+/third_party/
+/port/
+/pics/
+/issues/
+/benchmarks/
+/.cache/
+/LevelDB_README.md
+/README.md

@@ -298,17 +298,6 @@ target_link_libraries(leveldbutil leveldb)
 
 # ===== 新增：编译分布式 KV 系统的 Master 和 Slave 和 Client =====
 add_executable(master "distributed/master.cc")
-target_link_libraries(master leveldb)
-target_compile_definitions(master
-  PRIVATE
-    ${LEVELDB_PLATFORM_NAME}=1
-)
-if (NOT HAVE_CXX17_HAS_INCLUDE)
-  target_compile_definitions(master
-    PRIVATE
-      LEVELDB_HAS_PORT_CONFIG_H=1
-  )
-endif(NOT HAVE_CXX17_HAS_INCLUDE)
 
 add_executable(slave "distributed/slave.cc")
 target_link_libraries(slave leveldb)
