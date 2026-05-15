@@ -53,6 +53,13 @@ class DBImpl : public DB {
   Iterator* NewAddrIterator(const ReadOptions&) override;
   const Snapshot* GetSnapshot() override;
   void ReleaseSnapshot(const Snapshot* snapshot) override;
+
+  // DisKV 分布式扩展：直接操作 LSM-Tree 中的 key→addr 映射，绕过 vlog
+  Status PutAddress(const WriteOptions& options, const Slice& key,
+                    const Slice& addr) override;
+  Status GetAddress(const ReadOptions& options, const Slice& key,
+                    std::string* addr) override;
+  Status DeleteKey(const WriteOptions& options, const Slice& key) override;
   bool GetProperty(const Slice& property, std::string* value) override;
   void GetApproximateSizes(const Range* range, int n, uint64_t* sizes) override;
   void CompactRange(const Slice* begin, const Slice* end) override;

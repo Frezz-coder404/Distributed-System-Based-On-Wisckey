@@ -296,8 +296,27 @@ add_executable(leveldbutil
 )
 target_link_libraries(leveldbutil leveldb)
 
-# ===== 新增：编译分布式 KV 系统的 Master 和 Slave 和 Client =====
+# ===== DisKV 分布式 KV 系统：Master（主节点）、Slave（从节点）、Client（客户端） =====
+#
+# 架构说明（节点级键值分离）：
+#   Master : 运行 WiscKey LSM-Tree（no_vlog=true），存储 key → vlog地址 映射
+#            数据库目录: ./diskv_master_db (仅 .ldb / MANIFEST / CURRENT)
+#   Slave  : 仅存储 vlog 文件（*.log），与 Master 通信获取/存储地址
+#            数据库目录: ./diskv_slave_vlog_<id> (仅 .log 文件)
+#   Client : 直接与 Slave 交互，协议不变
+#
 add_executable(master "distributed/master.cc")
+target_link_libraries(master leveldb)
+target_compile_definitions(master
+  PRIVATE
+    ${LEVELDB_PLATFORM_NAME}=1
+)
+if (NOT HAVE_CXX17_HAS_INCLUDE)
+  target_compile_definitions(master
+    PRIVATE
+      LEVELDB_HAS_PORT_CONFIG_H=1
+  )
+endif(NOT HAVE_CXX17_HAS_INCLUDE)
 
 add_executable(slave "distributed/slave.cc")
 target_link_libraries(slave leveldb)
@@ -313,7 +332,7 @@ if (NOT HAVE_CXX17_HAS_INCLUDE)
 endif(NOT HAVE_CXX17_HAS_INCLUDE)
 
 add_executable(client "distributed/client.cc")
-# ===================================================
+# =====================================================================
 
 if(LEVELDB_BUILD_TESTS)
   enable_testing()

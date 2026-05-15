@@ -156,6 +156,14 @@ struct LEVELDB_EXPORT Options {
 
   // vlog文件大小上限值
   uint64_t max_vlog_size;
+
+  // ==================== DisKV 分布式选项 ====================
+  // 如果为 true，则不创建 vlog 文件（.log 文件），仅使用 LSM-Tree 存储。
+  // 用于主节点：主节点只存储 key→addr 映射，实际值存储在从节点的 vlog 中。
+  // 注意：启用此选项后，只能使用 PutAddress/GetAddress/DeleteKey 操作，
+  //       不能使用普通的 Put/Get/Delete（因为它们依赖 vlog）。
+  bool no_vlog = false;
+  // ==========================================================
 };
 
 // Options that control read operations

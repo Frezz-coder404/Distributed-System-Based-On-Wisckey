@@ -99,6 +99,29 @@ class LEVELDB_EXPORT DB {
     return nullptr;
   }
 
+  // ==================== DisKV 分布式扩展：主节点地址操作 ====================
+  // PutAddress: 将 key → addr 直接存入 LSM-Tree，绕过 vlog 写入。
+  // 用于主节点存储"键到从节点 vlog 地址"的映射。
+  // addr 是已编码的地址字符串：<varint64:vlog_number><varint64:offset><varint64:size>
+  virtual Status PutAddress(const WriteOptions& options, const Slice& key,
+                            const Slice& addr) {
+    return Status::NotSupported("PutAddress not supported");
+  }
+
+  // GetAddress: 从 LSM-Tree 读取 key 对应的地址，不经过 vlog 取值。
+  // 用于主节点查找键对应的从节点 vlog 地址。
+  virtual Status GetAddress(const ReadOptions& options, const Slice& key,
+                            std::string* addr) {
+    return Status::NotSupported("GetAddress not supported");
+  }
+
+  // DeleteKey: 直接从 LSM-Tree 中删除 key（绕过 vlog 写入）。
+  // 用于主节点在收到从节点的 DELETE 请求时标记删除。
+  virtual Status DeleteKey(const WriteOptions& options, const Slice& key) {
+    return Status::NotSupported("DeleteKey not supported");
+  }
+  // =====================================================================
+
   // Return a handle to the current DB state.  Iterators created with
   // this handle will all observe a stable snapshot of the current DB
   // state.  The caller must call ReleaseSnapshot(result) when the

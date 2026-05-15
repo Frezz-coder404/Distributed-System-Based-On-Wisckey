@@ -56,6 +56,10 @@ class VlogManager {
 
   Status FetchValueFromVlog(Slice addr, std::string* value);
 
+  // 返回当前 vlog 文件的写入位置（文件偏移量），用于计算记录的地址，返回到主节点
+  // 返回值为 head_ + size_，即已刷盘字节数 + 缓冲区中尚未刷盘的字节数
+  uint64_t GetWritePos();
+
   void SetCurrentVlog(uint64_t vlog_numb);
 
  private:

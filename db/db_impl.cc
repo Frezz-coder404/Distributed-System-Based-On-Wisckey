@@ -1163,6 +1163,94 @@ Status DBImpl::Fetch(Slice addr, std::string* value) {
   return vlog_manager_.FetchValueFromVlog(addr, value);
 }
 
+// ==================== DisKV 分布式扩展实现 ====================
+
+// PutAddress: 将 key → addr 直接存入 LSM-Tree 的 memtable，绕过 vlog 写入。
+// 用于主节点存储"键到从节点 vlog 地址"的映射。
+// 注意：addr 必须是已编码的地址字符串 <varint64:vlog_number><varint64:offset><varint64:size>
+Status DBImpl::PutAddress(const WriteOptions& options, const Slice& key,
+                          const Slice& addr) {
+  Status status;
+  MutexLock l(&mutex_);
+  // 确保 memtable 有空间，必要时触发 compaction
+  status = MakeRoomForWrite(false);
+  if (status.ok()) {
+    SequenceNumber seq = versions_->LastSequence() + 1;
+    // 直接将 key → addr 插入 memtable（kTypeValue 表示这是一个有效值）
+    mem_->Add(seq, kTypeValue, key, addr);
+    versions_->SetLastSequence(seq);
+  }
+  return status;
+}
+
+// GetAddress: 从 LSM-Tree 读取 key 对应的地址，不经过 vlog 取值。
+// 与 Get() 的区别在于：不调用 FetchValueFromVlog()，直接返回 LSM-Tree 中存储的值。
+// LSM-Tree 中存储的值本身就是 vlog 地址（由 PutAddress 存入）。
+Status DBImpl::GetAddress(const ReadOptions& options, const Slice& key,
+                          std::string* addr) {
+  Status s;
+  MutexLock l(&mutex_);
+  SequenceNumber snapshot;
+  if (options.snapshot != nullptr) {
+    snapshot =
+        static_cast<const SnapshotImpl*>(options.snapshot)->sequence_number();
+  } else {
+    snapshot = versions_->LastSequence();
+  }
+
+  MemTable* mem = mem_;
+  MemTable* imm = imm_;
+  Version* current = versions_->current();
+  mem->Ref();
+  if (imm != nullptr) imm->Ref();
+  current->Ref();
+
+  bool have_stat_update = false;
+  Version::GetStats stats;
+
+  // 在 memtable / imm / SSTable 中查找 key
+  {
+    mutex_.Unlock();
+    LookupKey lkey(key, snapshot);
+    if (mem->Get(lkey, addr, &s)) {
+      // 在 memtable 中找到，addr 即为存储的 vlog 地址
+    } else if (imm != nullptr && imm->Get(lkey, addr, &s)) {
+      // 在 immutable memtable 中找到
+    } else {
+      s = current->Get(options, lkey, addr, &stats);
+      have_stat_update = true;
+    }
+    // 注意：不调用 FetchValueFromVlog！
+    // LSM-Tree 中存储的值本身就是从节点的 vlog 地址，无需二次取值。
+    mutex_.Lock();
+  }
+
+  if (have_stat_update && current->UpdateStats(stats)) {
+    MaybeScheduleCompaction();
+  }
+  mem->Unref();
+  if (imm != nullptr) imm->Unref();
+  current->Unref();
+  return s;
+}
+
+// DeleteKey: 直接从 LSM-Tree 中标记删除 key（绕过 vlog 写入）。
+// 用于主节点在收到从节点的 DELETE 请求时标记删除。
+Status DBImpl::DeleteKey(const WriteOptions& options, const Slice& key) {
+  Status status;
+  MutexLock l(&mutex_);
+  status = MakeRoomForWrite(false);
+  if (status.ok()) {
+    SequenceNumber seq = versions_->LastSequence() + 1;
+    // 插入删除标记（kTypeDeletion），value 为空
+    mem_->Add(seq, kTypeDeletion, key, Slice());
+    versions_->SetLastSequence(seq);
+  }
+  return status;
+}
+
+// ===================================================================
+
 Iterator* DBImpl::NewIterator(const ReadOptions& options) {
   SequenceNumber latest_snapshot;
   uint32_t seed;
@@ -1354,7 +1442,10 @@ Status DBImpl::MakeRoomForWrite(bool force) {
     vlog_head_ = 0;
 
     vlogfile_number_ = new_log_number;
-    vlog_manager_.AddVlog(dbname_, options_, new_log_number);
+    // DisKV: 如果 no_vlog 为 true，不创建 vlog 文件（主节点模式）
+    if (!options_.no_vlog) {
+      vlog_manager_.AddVlog(dbname_, options_, new_log_number);
+    }
     Log(options_.info_log, "new vlog %d...\n", new_log_number);
   }
   while (true) {
@@ -1512,7 +1603,10 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
     impl->vlogfile_number_ = new_log_number;
     impl->mem_ = new MemTable(impl->internal_comparator_);
     impl->mem_->Ref();
-    impl->vlog_manager_.AddVlog(dbname, options, new_log_number);
+    // DisKV: 如果 no_vlog 为 true，不创建 vlog 文件（主节点模式）
+    if (!options.no_vlog) {
+      impl->vlog_manager_.AddVlog(dbname, options, new_log_number);
+    }
   }
   if (s.ok() && save_manifest) {
     edit.SetPrevLogNumber(0);  // No older logs needed after recovery.

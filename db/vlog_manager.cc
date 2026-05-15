@@ -92,5 +92,13 @@ Status VlogManager::SetHead(size_t offset) {
   }
 }
 
+uint64_t VlogManager::GetWritePos() {
+  std::map<uint64_t, VlogInfo*>::const_iterator iter = manager_.find(cur_vlog_);
+  if (iter == manager_.end()) {
+    return 0;
+  }
+  return iter->second->head_ + iter->second->size_;
+}
+
 }  // namespace vlog
 }  // namespace leveldb

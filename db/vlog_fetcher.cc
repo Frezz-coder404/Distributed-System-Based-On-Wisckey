@@ -1,6 +1,6 @@
 
 #include "vlog_fetcher.h"
-
+#include "db/vlog_manager.h"
 #include <util/mutexlock.h>
 
 #include "filename.h"

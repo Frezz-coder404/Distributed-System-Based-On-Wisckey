@@ -12,34 +12,39 @@ sudo apt install libsnappy-dev                                        安装Snap
 git submodule update --init --recursive                               下载工程子模块，确保构建时完备(稍慢，建议挂梯子，或在cmake时忽略)
 rm -rf build                                                          清理旧build目录
 mkdir -p build && cd build                                            创建build文件夹并打开
-cmake -DCMAKE_BUILD_TYPE=Release -DLEVELDB_BUILD_BENCHMARKS=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ..     执行cmake构建并开启编译优化
+cmake -DCMAKE_BUILD_TYPE=Release -DLEVELDB_BUILD_BENCHMARKS=ON -DLEVELDB_BUILD_TESTS=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ..     执行cmake构建并开启编译优化,忽略子模块
 make -j$(nproc) master slave client                                   依据Makefile进行编译
 完成后会在build目录下看到可执行文件 master、slave，按照如下示例执行命令即可进行测试。
-# 2、打开三个终端并全进入build目录：
+# 2、打开四个终端并全进入build目录：
        (New Terminal)
        cd build
 # 3、启动所有 Slave：
-       终端1：启动 Slave 0（端口 8889）
-       ./slave 8889
-       终端2：启动 Slave 1（端口 8890）
-       ./slave 8890
-       终端3：启动 Slave 2（端口 8891）
-       ./slave 8891
+       终端1：启动 Slave 0
+       ./slave 0
+       终端2：启动 Slave 1
+       ./slave 1
+       终端3：启动 Slave 2
+       ./slave 2
 # 4、启动 Master：
-       终端4：启动 Master（端口 8888）
+       终端4：启动 Master
        ./master
-# 5、连接到 Master：
-       telnet 127.0.0.1 8888
-# 6、进行数据操作测试：
-注：目前只支持 ASCII 字符。
+# 5、启动 Client：
+       终端5：启动 client 并连接到主节点
+       ./client 127.0.0.1 8888
+# 6、获取路由表
+       在 client 终端输入：
+       HELLO
+       后会获取当前从节点的路由表，并断开与主节点的连接
+# 7、进行数据操作测试：
+注：目前只支持 ASCII 字符，其余字符会全部丢给 Worker2 。
 // Worker 0: 首字符 ASCII 0 ~ 42  : 从 空字符(0) 到 '*' (42)
 // Worker 1: 首字符 ASCII 43 ~ 85 : 从 '+' (43) 到 'U' (85)
 // Worker 2: 首字符 ASCII 86 ~ 127: 从 'V' (86) 到 DEL (127)
 例：
-       PUT hello_world
+       PUT 1 hello_world
        返回: OK 1
 
-       PUT foo_bar
+       PUT a foo_bar
        返回: OK 2
 
        GET 1
@@ -51,7 +56,7 @@ make -j$(nproc) master slave client                                   依据Make
        GET 1
        返回: NOT FOUND
 执行成功后默认会在 wisckey/build/wisckey_db_worker_* 下生成数据库数据与日志
-# 7、进行持久化测试：
+# 8、进行持久化测试：
 使用 Ctrl+C 退出,
 当显示已安全关闭数据库后，数据落盘，这时重新连接测试即可。
 
@@ -60,13 +65,24 @@ make -j$(nproc) master slave client                                   依据Make
        MANIFEST-*	       二进制	  记录数据库版本等（所有 SSTable 的元数据）
        *.ldb	              二进制	  一个SSTable，只存储（键+地址），因而非常小
        *.log	              二进制	  用来存储值的vlog，不会消失。
-       (注：在LevelDB中.log存储的是WAL预写日志，或者叫内存中的MemTable在磁盘的副本，随MemTable落盘而消失)
+       (注：在LevelDB中.log存储的是WAL预写日志，或者叫内存中的MemTable在磁盘的副本，随MemTable落盘而消失，而在Wisckey中沿用了其名称和功能，该文件变为用于存储vlog的文件，不会消失)
        LOCK	              空/文本  进程锁文件
        LOG / LOG.old	       文本	  数据库运行日志，当数据库重启后，原先的LOG会变为LOG.old
 
-# // TODO 将从节点被动链接主节点 改为 从节点主动链接主节点，从节点端口不再硬编码
-# // TODO 将主节点传输消息 改为 主节点告诉客户端应该连接哪个从节点去完成交互
-# // TODO 将vlog单独存放在从节点，完成彻底的键值分离
+# 变更说明：
+文件	             变更说明
+options.h	     新增 bool no_vlog = false 选项
+db.h	            新增 PutAddress、GetAddress、DeleteKey 虚方法
+db_impl.h	     声明 PutAddress、GetAddress、DeleteKey
+db_impl.cc	     实现三个方法（绕过 vlog，直接操作 LSM-Tree）；DB::Open 和 MakeRoomForWrite   中跳过 vlog 创建
+vlog_manager.h     新增 GetWritePos() 方法声明
+vlog_manager.cc    实现 GetWritePos()，用于记录写入的位置，便于传回主节点进行记录
+master.cc	     完全重写：运行 WiscKey LSM-Tree，处理客户端 HELLO/QUIT + 从节点内部协议
+slave.cc	     完全重写：仅管理 vlog 文件，通过内部协议与主节点通信
+client.cc	     无需修改（协议不变）
+CMakeLists.txt     master 链接 leveldb 库
+
+
 # // TODO 在分布式上实现如下测试集操作
 关键操作：
 --benchmarks	        指定要运行的测试（逗号分隔），如 fillseq,readrandom	内置多个测试项
