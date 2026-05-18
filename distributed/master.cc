@@ -71,7 +71,10 @@ const int WORKER_COUNT = 3;                     // 从节点总数
 
 // 从节点对外服务端口（客户端直连用），用于构建路由表
 const int SLAVE_CLIENT_PORTS[WORKER_COUNT] = {9000, 9001, 9002};
-const std::string SLAVE_IP = "127.0.0.1";
+// 从节点 IP
+#define SLAVE0_IP "127.0.0.1"
+#define SLAVE1_IP "127.0.0.1"
+#define SLAVE2_IP "127.0.0.1"
 
 // ASCII 静态分区表：Worker i 负责首字符 ASCII ∈ [range_start, range_end] 的 key
 const int WORKER_RANGES[WORKER_COUNT][2] = {{0, 42}, {43, 85}, {86, 127}};
@@ -167,15 +170,16 @@ void get_worker_range(int worker_id, int* range_start, int* range_end) {
 // 格式：
 //   ROUTETABLE\r\n
 //   INDEX | IP:PORT | RANGE\r\n
-//   0 127.0.0.1:9000 0-42\r\n
-//   1 127.0.0.1:9001 43-85\r\n
-//   2 127.0.0.1:9002 86-127\r\n
+//   0 <SLAVE0_IP>:9000 0-42\r\n
+//   1 <SLAVE1_IP>:9001 43-85\r\n
+//   2 <SLAVE2_IP>:9002 86-127\r\n
 //   END\r\n
 std::string build_route_table() {
   std::string table = "ROUTETABLE\r\n";
   table += "INDEX | IP:PORT | RANGE\r\n";
+  const char* slave_ips[WORKER_COUNT] = {SLAVE0_IP, SLAVE1_IP, SLAVE2_IP};
   for (int i = 0; i < WORKER_COUNT; ++i) {
-    table += std::to_string(i) + " " + SLAVE_IP + ":" +
+    table += std::to_string(i) + " " + slave_ips[i] + ":" +
              std::to_string(SLAVE_CLIENT_PORTS[i]) + " " +
              std::to_string(WORKER_RANGES[i][0]) + "-" +
              std::to_string(WORKER_RANGES[i][1]) + "\r\n";
@@ -547,8 +551,8 @@ int main() {
   struct sockaddr_in master_client_addr;
   memset(&master_client_addr, 0, sizeof(master_client_addr));
   master_client_addr.sin_family = AF_INET;
-  master_client_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 127.0.0.1
-  master_client_addr.sin_port = htons(MASTER_CLIENT_PORT);       // 8888
+  master_client_addr.sin_addr.s_addr = htonl(INADDR_ANY); // 任意IP
+  master_client_addr.sin_port = htons(MASTER_CLIENT_PORT); // 8888
 
   if (bind(master_client_fd, (struct sockaddr*)&master_client_addr, sizeof(master_client_addr)) < 0) {
     std::cerr << "绑定 master_client 失败" << std::endl;
@@ -558,7 +562,7 @@ int main() {
     std::cerr << "监听 client 端口失败" << std::endl;
     close(master_client_fd); delete g_db; return 1;
   }
-  std::cout << "Master: 客户端监听 [127.0.0.1:" << MASTER_CLIENT_PORT << "]" << std::endl;
+  std::cout << "Master: 客户端监听 [0.0.0.0:" << MASTER_CLIENT_PORT << "] (INADDR_ANY)" << std::endl;
 
   // --- 1b. 从节点监听套接字（Worker 0→8889, Worker 1→8890, Worker 2→8891） ---
   // 设计要点：每个从节点独占一个端口，主节点根据 accept 的端口直接确定 worker_id
@@ -576,7 +580,7 @@ int main() {
     struct sockaddr_in waddr;
     memset(&waddr, 0, sizeof(waddr));
     waddr.sin_family = AF_INET;
-    waddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    waddr.sin_addr.s_addr = htonl(INADDR_ANY);
     waddr.sin_port = htons(MASTER_WORKER_PORT_BASE + i);  // 8889 + i
 
     if (bind(fd, (struct sockaddr*)&waddr, sizeof(waddr)) < 0) {
@@ -593,8 +597,8 @@ int main() {
       close(master_client_fd); delete g_db; return 1;
     }
     worker_listen_fds[i] = fd;
-    std::cout << "Master: Worker " << i << " 监听 [127.0.0.1:"
-              << (MASTER_WORKER_PORT_BASE + i) << "]" << std::endl;
+    std::cout << "Master: Worker " << i << " 监听 [0.0.0.0:"
+              << (MASTER_WORKER_PORT_BASE + i) << "] (INADDR_ANY)" << std::endl;
   }
 
   // ===== 阶段2：等待所有从节点连接（非阻塞轮询，支持任意顺序接入） =====

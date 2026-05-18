@@ -1053,7 +1053,7 @@ int main(int argc, char* argv[]) {
   struct sockaddr_in slave_addr;
   memset(&slave_addr, 0, sizeof(slave_addr));
   slave_addr.sin_family = AF_INET;
-  slave_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  slave_addr.sin_addr.s_addr = htonl(INADDR_ANY);
   slave_addr.sin_port = htons(SLAVE_CLIENT_PORTS[worker_id]);
 
   if (bind(slave_listen_fd, (struct sockaddr*)&slave_addr, sizeof(slave_addr)) < 0) {
@@ -1066,8 +1066,8 @@ int main(int argc, char* argv[]) {
     g_running = false; if (g_gc_thread) pthread_join(g_gc_thread, nullptr);
     close(slave_listen_fd); close(g_master_fd); shutdown_vlog(); return 1;
   }
-  std::cout << "Worker " << worker_id << ": 客户端监听已建立 [127.0.0.1:"
-            << SLAVE_CLIENT_PORTS[worker_id] << "]" << std::endl;
+  std::cout << "Worker " << worker_id << ": 客户端监听已建立 [0.0.0.0:"
+            << SLAVE_CLIENT_PORTS[worker_id] << "] (INADDR_ANY)" << std::endl;
 
   // ===== 阶段3: 创建 epoll 实例并注册 fd =====
   int epoll_fd = epoll_create1(0);
