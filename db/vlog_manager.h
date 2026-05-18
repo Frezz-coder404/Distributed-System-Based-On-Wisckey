@@ -60,6 +60,10 @@ class VlogManager {
   // 返回值为 head_ + size_，即已刷盘字节数 + 缓冲区中尚未刷盘的字节数
   uint64_t GetWritePos();
 
+  // 将当前 vlog 的内存缓冲区强制刷盘（SyncedAppend + head_ 递增 + size_ 清零）
+  // 调用时机：创建新 vlog 文件前（确保旧文件数据落盘）、正常退出前
+  void FlushCurrentBuffer();
+
   void SetCurrentVlog(uint64_t vlog_numb);
 
  private:

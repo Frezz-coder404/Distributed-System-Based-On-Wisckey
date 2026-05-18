@@ -100,5 +100,19 @@ uint64_t VlogManager::GetWritePos() {
   return iter->second->head_ + iter->second->size_;
 }
 
+// 将当前 vlog 的内存缓冲区中的数据强制写入磁盘文件
+// ★ 写入路径：buffer_ → WritableFile::SyncedAppend → fsync
+//   写入后更新 head_（已刷盘的逻辑偏移）并清零 size_（缓冲区空闲）
+void VlogManager::FlushCurrentBuffer() {
+  std::map<uint64_t, VlogInfo*>::const_iterator iter = manager_.find(cur_vlog_);
+  if (iter == manager_.end() || iter->second == nullptr) return;
+  if (iter->second->size_ > 0) {
+    iter->second->vlog_write_->dest_->SyncedAppend(
+        Slice(iter->second->buffer_, iter->second->size_));
+    iter->second->head_ += iter->second->size_;
+    iter->second->size_ = 0;
+  }
+}
+
 }  // namespace vlog
 }  // namespace leveldb

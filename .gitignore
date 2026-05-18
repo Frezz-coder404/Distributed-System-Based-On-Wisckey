@@ -12,10 +12,5 @@ cmake-build-release
 
 # Additional project ignores.
 /third_party/
-/port/
 /pics/
-/issues/
-/benchmarks/
-/.cache/
-/LevelDB_README.md
-/README.md
+/.continue/

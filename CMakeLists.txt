@@ -332,6 +332,27 @@ if (NOT HAVE_CXX17_HAS_INCLUDE)
 endif(NOT HAVE_CXX17_HAS_INCLUDE)
 
 add_executable(client "distributed/client.cc")
+
+# DisKV 自动测试客户端
+add_executable(test_client "")
+target_sources(test_client
+  PRIVATE
+    "${PROJECT_BINARY_DIR}/${LEVELDB_PORT_CONFIG_DIR}/port_config.h"
+    "util/histogram.cc"
+    "util/histogram.h"
+    "distributed/test_client.cc"
+)
+target_link_libraries(test_client leveldb)
+target_compile_definitions(test_client
+  PRIVATE
+    ${LEVELDB_PLATFORM_NAME}=1
+)
+if (NOT HAVE_CXX17_HAS_INCLUDE)
+  target_compile_definitions(test_client
+    PRIVATE
+      LEVELDB_HAS_PORT_CONFIG_H=1
+  )
+endif(NOT HAVE_CXX17_HAS_INCLUDE)
 # =====================================================================
 
 if(LEVELDB_BUILD_TESTS)
