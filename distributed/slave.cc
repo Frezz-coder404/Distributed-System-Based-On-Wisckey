@@ -85,8 +85,8 @@ static const int kVHeaderSize = 12;                // vlog 记录头部大小: C
 
 // GC 参数
 static const uint64_t kGcIntervalSec = 30;              // GC 检查间隔（秒）
-static const int kGcVlogFileCountThreshold = 8;          // 初始 GC 触发阈值（非活跃 vlog 文件数 >= 此值时触发）
-static const int VlogSize = 64 * 1024 * 1024;            // 单个 vlog 文件大小(Bytes)
+static const int kGcVlogFileCountThreshold = 3;          // 初始 GC 触发阈值（非活跃 vlog 文件数 >= 此值时触发）
+static const int VlogSize = 32 * 1024 * 1024;            // 单个 vlog 文件大小(Bytes)
 
 // ★ 垃圾率动态阈值调整水线（宏定义，可按需调参）
 #define GC_HIGH_WATER  40   // 垃圾率 >= 此值 → 阈值-1（数据很"脏"，加快 GC 步调）

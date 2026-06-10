@@ -22,6 +22,7 @@
 //     readmissing   — 随机读取 N 条不存在的键
 //     readhot       — 随机读取 DB 前 1% 热点数据
 //     scanall       — 全库范围扫描（不受 --num 限制）
+//     gc            — 手动触发所有从节点的垃圾回收
 //   --num=<N>             单次操作的记录数  （scanall 除外）
 //   --key_size=<N>        键的字节大小     （默认 16）
 //   --value_size=<N>      值的字节大小     （默认 100）
@@ -526,52 +527,90 @@ void bench_readhot(leveldb::Histogram* hist, int64_t num, class Random* rnd,
   std::cout << "  找到: " << found << "/" << num << std::endl;
 }
 
-// 全库扫描: SCAN <min_key> <max_key>（覆盖所有从节点）
-// 向每个从节点分别发送 SCAN，合并结果
+// 全库扫描: 向每个从节点发送 SCAN ! ~（覆盖所有可打印 ASCII 字符）
+// 主节点的 SCAN_ADDR 内部按 worker_id 自动过滤，各从节点仅返回自己分区的键值对
+// ★ 采用增量解析：边接收边计数，避免将整个响应缓冲在内存中
 void bench_scanall(leveldb::Histogram* hist) {
   std::cout << "scanall: 全库范围扫描..." << std::endl;
   int total_kv = 0;
 
   for (int wid = 0; wid < WORKER_COUNT; ++wid) {
     int fd = get_slave_fd(wid);
-    if (fd < 0) continue;
+    if (fd < 0) { std::cout << "  Worker " << wid << ": 连接失败，跳过" << std::endl; continue; }
 
-    // 该从节点负责的 ASCII 范围
-    int range_start = (wid == 0) ? 32 : (wid == 1) ? 43 : 86;  // 跳过控制字符
-    int range_end   = (wid == 0) ? 42 : (wid == 1) ? 85 : 126;
-    std::string start_key(1, static_cast<char>(range_start));
-    std::string end_key(1, static_cast<char>(range_end));
-
-    std::string req = "SCAN " + start_key + " " + end_key + "\n";
+    std::string req = "SCAN ! ~\n";
     auto t0 = std::chrono::high_resolution_clock::now();
-    if (write(fd, req.c_str(), req.size()) < 0) continue;
+    if (write(fd, req.c_str(), req.size()) < 0) { std::cout << "  Worker " << wid << ": 发送失败" << std::endl; continue; }
 
-    // 读取多行响应
-    std::string response;
-    char buf[4096];
-    while (true) {
+    // ★ 增量解析：使用 64KB 缓冲区，边接收边按 \n 切分行并计数 KVPAIR
+    std::string leftover;  // 跨 read 边界残留的不完整行
+    int kv_count = 0;
+    char buf[65536];
+    bool ended = false;
+    while (!ended) {
       ssize_t n = read(fd, buf, sizeof(buf) - 1);
-      if (n < 0) { if (errno == EINTR) continue; break; }
-      else if (n == 0) break;
-      buf[n] = '\0'; response += buf;
-      if (response.find("END\r\n") != std::string::npos ||
-          response.find("END\n") != std::string::npos) break;
+      if (n < 0) { if (errno == EINTR) continue; std::cerr << "  Worker " << wid << ": read 错误" << std::endl; break; }
+      else if (n == 0) { std::cerr << "  Worker " << wid << ": 连接关闭" << std::endl; break; }
+      buf[n] = '\0';
+      leftover += buf;
+
+      // 按 \n 切分已接收数据中的完整行，保留最后一段不完整行到 leftover
+      size_t pos = 0;
+      while (true) {
+        size_t nl = leftover.find('\n', pos);
+        if (nl == std::string::npos) {
+          leftover = leftover.substr(pos);  // 保留不完整尾部
+          break;
+        }
+        std::string line = leftover.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        pos = nl + 1;
+
+        if (line == "END") { ended = true; leftover.clear(); break; }
+        if (line.find("KVPAIR ") == 0) kv_count++;
+      }
     }
     auto t1 = std::chrono::high_resolution_clock::now();
 
-    // 统计 KVPAIR 行数
-    std::istringstream iss(response);
-    std::string line;
-    int kv_count = 0;
-    while (std::getline(iss, line)) {
-      if (line.find("KVPAIR ") == 0) kv_count++;
-    }
     total_kv += kv_count;
-    std::cout << "  Worker " << wid << ": " << kv_count << " 条 KV" << std::endl;
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::cout << "  Worker " << wid << ": " << kv_count << " 条 KV"
+              << " (" << elapsed_ms << " ms)" << std::endl;
 
     if (hist) hist->Add(std::chrono::duration<double, std::micro>(t1 - t0).count());
+
+    // ★ 每次 SCAN 后关闭并从缓存中移除连接，确保下次 get_slave_fd 重新建立干净连接
+    close(fd);
+    slave_fds.erase(wid);
   }
   std::cout << "  总计: " << total_kv << " 条 KV" << std::endl;
+}
+
+// 手动 GC: 向每个从节点发送 GC 命令，触发一次垃圾回收
+void bench_gc(leveldb::Histogram* hist) {
+  std::cout << "gc: 手动触发垃圾回收..." << std::endl;
+
+  for (int wid = 0; wid < WORKER_COUNT; ++wid) {
+    int fd = get_slave_fd(wid);
+    if (fd < 0) { std::cout << "  Worker " << wid << ": 连接失败，跳过" << std::endl; continue; }
+
+    std::string req = "GC\n";
+    auto t0 = std::chrono::high_resolution_clock::now();
+    if (write(fd, req.c_str(), req.size()) < 0) { std::cout << "  Worker " << wid << ": 发送失败" << std::endl; continue; }
+
+    std::string resp = read_slave_response(fd);
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::string result = trim(resp);
+    std::cout << "  Worker " << wid << ": " << result
+              << " (" << elapsed_ms << " ms)" << std::endl;
+
+    if (hist) hist->Add(std::chrono::duration<double, std::micro>(t1 - t0).count());
+
+    close(fd);
+    slave_fds.erase(wid);
+  }
 }
 
 // 打印直方图
@@ -688,6 +727,8 @@ void run_benchmark(const BenchCommand& cmd, const std::string& host, int port) {
       bench_readhot(phist, FLAGS_num, &rnd, key_range);
     } else if (bench_name == "scanall") {
       bench_scanall(phist);
+    } else if (bench_name == "gc") {
+      bench_gc(phist);
     } else {
       std::cerr << "未知操作: " << bench_name << std::endl;
     }
@@ -729,7 +770,7 @@ int main(int argc, char* argv[]) {
   std::cout << "主节点: " << host << ":" << port << std::endl;
   std::cout << "请输入测试命令（格式: --benchmarks=... --num=... ...）" << std::endl;
   std::cout << "支持的操作: fillseq fillrandom overwrite deleteseq deleterandom"
-            << " readseq readreverse readrandom readmissing readhot scanall" << std::endl;
+            << " readseq readreverse readrandom readmissing readhot scanall gc" << std::endl;
   std::cout << "可用参数: --benchmarks --num --key_size --value_size --histogram --use_existing_db" << std::endl;
   std::cout << "输入 quit 退出客户端" << std::endl;
 

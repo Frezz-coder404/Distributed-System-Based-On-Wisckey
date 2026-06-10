@@ -116,10 +116,11 @@ readreverse	             逆序读取 N 条记录
 readrandom	             随机读取 N 条记录
 readmissing	             随机读取 N 条不存在的键
 readhot      	             随机读取 DB 前 1% 的热点数据
+scanall                    全库范围扫描
 
 输入命令和参数进行测试即可。
 示例：
---benchmarks=fillseq --num=40960 --value_size=100000 --histogram=1
+--benchmarks=fillseq --num=65536 --value_size=100000 --histogram=1
 
 
 # 对于Wisckey代码的变更说明：
