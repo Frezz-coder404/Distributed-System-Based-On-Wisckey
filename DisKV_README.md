@@ -1,9 +1,29 @@
 使用说明：
 Author:Frezz
 
+# gitee仓库克隆： git clone https://gitee.com/frezz/Distributed-System-Based-On-Wisckey.git
+# github仓库克隆：
+
 # 什么是DisKV
 DisKV是我基于LevelDB/Wisckey设计的节点级键值分离分布式系统。我设计的分布式主节点、从节点、客户端相关代码存放在 distributed 目录下，您可通过修改宏定义的"IP"以装配到离散集群中。
-用于手动测试的客户端为 distributed/test_client，自动测试的客户端为 distributed/test_client ，注意 benchmarks 目录是 LevelDB 的测试集，请不要选错，具体编译运行方法见下：
+用于手动测试的客户端为 distributed/test_client，
+自动测试的客户端为 distributed/test_client ，
+注意 benchmarks 目录是 LevelDB 的测试集，请不要选错，具体测试方法见下文。
+
+DisKV的文件目录树：
+.
+├── DisKV_README.md    该项目的说明文档
+├── benchmarks         LevelDB与Wisckey的测试集与测试代码            
+├── db                 键值数据库存储部分的关键实现
+├── distributed        分布式节点的实现*该项目的关键实现部分*
+├── doc                原LevelDB与其它文档
+├── helpers            内存文件系统环境
+├── include            自定义头文件
+├── issues             原LevelDB问题测试代码
+├── port               平台移植适配
+├── table              关键存储数据结构与方法定义
+├── third_party        子模块
+└── util               底层工具与接口
 
 # 可能的问题与报错说明：
 1、在编译 Wisckey 项目时遇到 gmock/gmock.h: No such file or directory 错误，说明构建过程缺少 Google Mock 头文件。使用 sudo apt-get install libgtest-dev libgmock-dev 安装。
@@ -20,7 +40,7 @@ const std::string MASTER_HOST = "127.0.0.1";
 # 2、构建与编译：
 编译流程：（在根目录下）
 sudo apt install libsnappy-dev                                        安装Snappy开发库(当然git与GCC也要装)
-git submodule update --init --recursive                               下载工程子模块，确保构建时完备(稍慢，可跳过此步在cmake时忽略)
+git submodule update --init --recursive                               下载工程子模块(稍慢，可跳过此步并在cmake时忽略)
 rm -rf build                                                          清理旧build目录
 mkdir -p build && cd build                                            创建build文件夹并打开
 cmake -DCMAKE_BUILD_TYPE=Release -DLEVELDB_BUILD_BENCHMARKS=ON -DLEVELDB_BUILD_TESTS=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ..       执行cmake构建并开启编译优化,忽略子模块
