@@ -2,7 +2,7 @@
 Author:Frezz
 
 # gitee仓库克隆： git clone https://gitee.com/frezz/Distributed-System-Based-On-Wisckey.git
-# github仓库克隆：
+# github仓库克隆：git clone https://github.com/Frezz-coder404/Distributed-System-Based-On-Wisckey.git
 
 # 什么是DisKV
 DisKV是我基于LevelDB/Wisckey设计的节点级键值分离分布式系统。我设计的分布式主节点、从节点、客户端相关代码存放在 distributed 目录下，您可通过修改宏定义的"IP"以装配到离散集群中。
